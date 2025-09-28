@@ -1,7 +1,7 @@
 {
-  "name": "field-starter",
+  "name": "asset-price-inquiry",
   "version": "1.0.0",
-  "description": "",
+  "description": "Asset Price Inquiry - A field shortcut for querying stock and fund prices",
   "main": "index.js",
   "scripts": {
     "start": "block-basekit-cli start:field",
@@ -9,7 +9,8 @@
     "pack": "block-basekit-cli pack:field",
     "dev": "block-basekit-cli dev:field"
   },
-  "author": "",
+  "keywords": ["stock", "fund", "price", "inquiry", "field-shortcut"],
+  "author": "liuxie",
   "license": "ISC",
   "devDependencies": {
     "@lark-opdev/block-basekit-cli": "1.0.5"
