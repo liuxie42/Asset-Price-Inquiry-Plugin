@@ -1,12 +1,248 @@
 import { basekit, FieldType, field, FieldComponent, FieldCode, NumberFormatter } from '@lark-opdev/block-basekit-server-api';
 const { t } = field;
 
+// 配置常量
+const CONFIG = {
+  PRICE_RANGE: { MIN: 0.01, MAX: 10000 },
+  REQUEST_TIMEOUT: 10000,
+  RETRY_COUNT: 3,  // 增加重试次数
+  RETRY_DELAY: 1000,  // 重试延迟
+  PRICE_UNAVAILABLE: null,
+  CACHE_TTL: 60000,  // 缓存1分钟
+};
+
+// 请求缓存
+const requestCache = new Map<string, { data: any; timestamp: number }>();
+
+// 优化的网络请求函数 - 带重试机制
+async function fetchWithRetry(url: string, options: RequestInit = {}): Promise<Response> {
+  let lastError: Error;
+  
+  for (let attempt = 1; attempt <= CONFIG.RETRY_COUNT; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
+      
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (response.ok) {
+        return response;
+      }
+      
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      
+    } catch (error) {
+      lastError = error as Error;
+      
+      if (attempt < CONFIG.RETRY_COUNT) {
+        // 指数退避延迟
+        const delay = CONFIG.RETRY_DELAY * Math.pow(2, attempt - 1);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  throw lastError!;
+}
+
+// 带缓存的请求函数
+async function fetchWithCache(url: string, options: RequestInit = {}): Promise<string> {
+  const cacheKey = `${url}_${JSON.stringify(options)}`;
+  const cached = requestCache.get(cacheKey);
+  
+  // 检查缓存是否有效
+  if (cached && (Date.now() - cached.timestamp) < CONFIG.CACHE_TTL) {
+    return cached.data;
+  }
+  
+  try {
+    const response = await fetchWithRetry(url, options);
+    const text = await response.text();
+    
+    // 存入缓存
+    requestCache.set(cacheKey, {
+      data: text,
+      timestamp: Date.now()
+    });
+    
+    // 清理过期缓存
+    cleanExpiredCache();
+    
+    return text;
+  } catch (error) {
+    throw new Error(`网络请求失败: ${error.message}`);
+  }
+}
+
+// 清理过期缓存
+function cleanExpiredCache() {
+  const now = Date.now();
+  for (const [key, value] of requestCache.entries()) {
+    if (now - value.timestamp > CONFIG.CACHE_TTL) {
+      requestCache.delete(key);
+    }
+  }
+}
+
+// 简化的编码处理函数
+function decodeStockName(arrayBuffer: ArrayBuffer): string {
+  // 优先尝试GBK编码，这是腾讯API的默认编码
+  try {
+    const decoder = new TextDecoder('gbk');
+    const text = decoder.decode(arrayBuffer);
+    
+    const dataMatch = text.match(/="([^"]+)"/);
+    if (dataMatch && dataMatch[1]) {
+      const dataArr = dataMatch[1].split('~');
+      const name = dataArr[1] || '';
+      
+      // 简单验证：检查是否包含乱码
+      if (name && !name.includes('�') && !name.includes('锟斤拷')) {
+        return name;
+      }
+    }
+  } catch (e) {
+    // GBK解码失败，尝试UTF-8
+  }
+  
+  // 备用方案：UTF-8编码
+  try {
+    const decoder = new TextDecoder('utf-8');
+    const text = decoder.decode(arrayBuffer);
+    
+    const dataMatch = text.match(/="([^"]+)"/);
+    if (dataMatch && dataMatch[1]) {
+      const dataArr = dataMatch[1].split('~');
+      return dataArr[1] || '';
+    }
+  } catch (e) {
+    // UTF-8也失败了
+  }
+  
+  return '';
+}
+
+// 优化后的基金数据获取函数
+async function fetchFundData(fundCode: string): Promise<string> {
+  return await fetchWithCache(`https://fund.eastmoney.com/${fundCode}.html`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+  });
+}
+
 const feishuDm = ['feishu.cn', 'feishucdn.com', 'larksuitecdn.com', 'larksuite.com'];
-// 通过addDomainList添加请求接口的域名，支持股票和基金查询
 basekit.addDomainList([...feishuDm, 'qt.gtimg.cn', 'fund.eastmoney.com']);
 
+// 输入验证函数
+function validateStockCode(code: string): { isValid: boolean; type: 'stock' | 'fund' | 'unknown'; message?: string } {
+  const trimmedCode = code.trim().toLowerCase();
+  
+  if (!trimmedCode) {
+    return {
+      isValid: false,
+      type: 'unknown',
+      message: '请输入有效的股票代码（如：sh000001、sz000001、hk00700、usAAPL）或基金代码（如：000311）'
+    };
+  }
+  
+  // 基金代码：6位数字
+  if (/^\d{6}$/.test(trimmedCode)) {
+    return { isValid: true, type: 'fund' };
+  }
+  
+  // 股票代码：各种格式
+  if (/^(sh|sz|hk|us)[a-z0-9]+$/i.test(trimmedCode) || /^\d{6}$/.test(trimmedCode)) {
+    return { isValid: true, type: 'stock' };
+  }
+  
+  return {
+    isValid: false,
+    type: 'unknown',
+    message: '请输入有效的股票代码（如：sh000001、sz000001、hk00700、usAAPL）或基金代码（如：000311）'
+  };
+}
+
+// 基金名称解析函数
+function parseFundName(html: string, fundCode: string): string {
+  const namePatterns = [
+    /<title>([^<]+?)(?:\s*\([^)]*\))?\s*(?:基金|净值).*?<\/title>/i,
+    /<h1[^>]*>([^<]+?)<\/h1>/i,
+  ];
+
+  for (const pattern of namePatterns) {
+    const match = html.match(pattern);
+    if (match && match[1]) {
+      const name = match[1].trim();
+      if (name && name !== `基金${fundCode}`) {
+        return name;
+      }
+    }
+  }
+
+  return `基金${fundCode}`;
+}
+
+// 基金价格解析函数
+function parseFundPrice(html: string): number {
+  const pricePatterns = [
+    /单位净值[^0-9]*(\d+\.\d{2,4})/i,
+    /最新净值[^0-9]*(\d+\.\d{2,4})/i,
+    /(\d+\.\d{4})/g
+  ];
+
+  for (const pattern of pricePatterns) {
+    const matches = html.match(pattern);
+    if (matches) {
+      const price = parseFloat(matches[1]);
+      if (!isNaN(price) && price >= CONFIG.PRICE_RANGE.MIN && price <= CONFIG.PRICE_RANGE.MAX) {
+        return price;
+      }
+    }
+  }
+  
+  return -1;
+}
+
+// 基金日期解析函数
+function parseFundDate(html: string): string {
+  const datePatterns = [
+    /(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/g,
+    /(\d{4}年\d{1,2}月\d{1,2}日)/g,
+    /更新时间[^0-9]*(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/gi,
+    /净值日期[^0-9]*(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/gi
+  ];
+
+  for (const pattern of datePatterns) {
+    const dateMatch = html.match(pattern);
+    if (dateMatch && dateMatch[1]) {
+      return dateMatch[1].replace(/年|月/g, '-').replace(/日/g, '').replace(/\//g, '-');
+    }
+  }
+  
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+// 股票交易日期获取函数
+function getActualTradeDate(dataArr: string[]): string {
+  if (dataArr.length > 30 && dataArr[30]) {
+    const dateStr = dataArr[30];
+    if (/^\d{8}$/.test(dateStr)) {
+      return `${dateStr.substring(0,4)}-${dateStr.substring(4,6)}-${dateStr.substring(6,8)}`;
+    }
+  }
+  
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
 basekit.addField({
-  // 定义捷径的i18n语言资源
   i18n: {
     messages: {
       'zh-CN': {
@@ -32,7 +268,6 @@ basekit.addField({
       },
     }
   },
-  // 定义捷径的入参
   formItems: [
     {
       key: 'stockCode',
@@ -46,7 +281,6 @@ basekit.addField({
       }
     },
   ],
-  // 定义捷径的返回结果类型
   resultType: {
     type: FieldType.Object,
     extra: {
@@ -73,7 +307,7 @@ basekit.addField({
         },
         {
           key: 'price',
-          type: FieldType.Number,
+          type: FieldType.Number,  // 恢复为Number类型
           label: t('stockPrice'),
           primary: true,
           extra: {
@@ -88,19 +322,24 @@ basekit.addField({
       ],
     },
   },
-  // formItemParams 为运行时传入的字段参数，对应字段配置里的 formItems （如引用的依赖字段）
   execute: async (formItemParams: { stockCode: string }, context) => {
     const { stockCode = '' } = formItemParams;
     
-    // 为空或者不是有效的代码格式时返回错误
-    if (!stockCode || !stockCode.trim()) {
+    // 输入验证
+    const validation = validateStockCode(stockCode);
+    if (!validation.isValid) {
       return {
-        code: FieldCode.Error,
-        message: '请输入有效的股票或基金代码'
+        code: FieldCode.Success,
+        data: {
+          id: `error_${Date.now()}`,
+          symbol: stockCode || '无效代码',
+          name: validation.message || '请输入有效的股票或基金代码',
+          price: -1001,  // 输入验证错误编码
+          date: new Date().toISOString().split('T')[0]
+        }
       };
     }
 
-    /** 为方便查看日志，使用此方法替代console.log */
     function debugLog(arg: any) {
       // @ts-ignore
       console.log(JSON.stringify({
@@ -112,24 +351,23 @@ basekit.addField({
 
     try {
       const inputCode = stockCode.trim();
-      
-      // 判断是基金代码还是股票代码
-      // 优先尝试基金查询，如果失败再尝试股票查询
       const isFundCode = /^\d{6}$/.test(inputCode);
       
       if (isFundCode) {
-        // 先尝试基金查询
         const fundResult = await queryFund(inputCode, context, debugLog);
         
-        // 如果基金查询成功且有有效数据，返回结果
         if (fundResult.code === FieldCode.Success && fundResult.hasValidData) {
+          // 优化价格显示
+          if (fundResult.data.price <= 0) {
+            fundResult.data.price = CONFIG.PRICE_UNAVAILABLE;
+            fundResult.data.name += '（价格暂不可用）';
+          }
           return {
             code: fundResult.code,
             data: fundResult.data
           };
         }
         
-        // 如果基金查询失败，记录错误并尝试股票查询
         if (fundResult.code === FieldCode.Error) {
           debugLog({
             '===基金查询失败，尝试股票查询': fundResult.message || '基金查询失败'
@@ -137,26 +375,35 @@ basekit.addField({
         }
       }
       
-      // 基金查询失败或不是基金代码，尝试股票查询
       const stockResult = await queryStock(inputCode, context, debugLog);
       
       if (stockResult.code === FieldCode.Success) {
+        // 优化价格显示
+        if (stockResult.data.price <= 0) {
+          stockResult.data.price = CONFIG.PRICE_UNAVAILABLE;
+          stockResult.data.name += '（价格暂不可用）';
+        }
         return {
           code: stockResult.code,
           data: stockResult.data
         };
       } else {
-        // 如果股票查询也失败，返回更详细的错误信息
         let errorMessage = (stockResult as any).message || '查询失败';
         
-        // 如果之前基金查询也失败了，合并错误信息
         if (isFundCode) {
           errorMessage = `基金和股票查询均失败。${errorMessage}`;
         }
         
+        // 将错误信息写入name，负数编码写入price
         return {
-          code: FieldCode.Error,
-          message: errorMessage
+          code: FieldCode.Success,
+          data: {
+            id: `error_${inputCode}_${Date.now()}`,
+            symbol: inputCode,
+            name: errorMessage,
+            price: isFundCode ? -2001 : -2002,  // -2001: 基金查询失败, -2002: 股票查询失败
+            date: new Date().toISOString().split('T')[0]
+          }
         };
       }
       
@@ -166,15 +413,22 @@ basekit.addField({
         '===999 异常错误': String(e)
       });
       
+      // 将异常信息写入name，负数编码写入price
       return {
-        code: FieldCode.Error,
-        message: `系统异常: ${String(e)}`
+        code: FieldCode.Success,
+        data: {
+          id: `exception_${Date.now()}`,
+          symbol: stockCode || '未知代码',
+          name: `系统异常: ${String(e)}`,
+          price: -9999,  // 系统异常编码
+          date: new Date().toISOString().split('T')[0]
+        }
       };
     }
   },
 });
 
-// 基金查询函数
+// 优化后的基金查询函数
 async function queryFund(fundCode: string, context: any, debugLog: Function): Promise<{
   code: FieldCode;
   data?: any;
@@ -186,151 +440,10 @@ async function queryFund(fundCode: string, context: any, debugLog: Function): Pr
       '===开始查询基金': fundCode
     });
 
-    const response = await fetch(`https://fund.eastmoney.com/${fundCode}.html`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-
-    if (!response.ok) {
-      return {
-        code: FieldCode.Error,
-        message: `基金代码 ${fundCode} 网络请求失败: ${response.status}`,
-        hasValidData: false
-      };
-    }
-
-    const html = await response.text();
-    
-    debugLog({
-      '===基金页面HTML长度': html.length,
-      '===HTML前500字符': html.substring(0, 500)
-    });
-
-    // 解析基金名称
-    let fundName = '';
-    const namePatterns = [
-      /<title>([^<]+?)(?:\s*\([^)]*\))?\s*(?:基金|净值|行情|详情|信息)?.*?<\/title>/i,
-      /<h1[^>]*>([^<]+?)\s*\([^)]*\)/i,
-      /<h1[^>]*>([^<]+?)<\/h1>/i,
-      /class="[^"]*title[^"]*"[^>]*>([^<]+?)\s*\([^)]*\)/i,
-      /class="[^"]*name[^"]*"[^>]*>([^<]+?)<\/[^>]+>/i
-    ];
-
-    for (const pattern of namePatterns) {
-      const nameMatch = html.match(pattern);
-      if (nameMatch && nameMatch[1]) {
-        fundName = nameMatch[1].trim();
-        if (fundName && !fundName.includes('基金') && !fundName.includes('东方财富')) {
-          debugLog({
-            '===匹配到基金名称': fundName,
-            '===使用模式': pattern.toString()
-          });
-          break;
-        }
-      }
-    }
-
-    // 如果没有找到名称，使用默认名称
-    if (!fundName) {
-      fundName = `基金${fundCode}`;
-    }
-
-    // 解析净值 - 使用多种策略
-    let netValue = -1; // 默认设为-1
-    
-    // 策略1: 提取所有四位小数的数字
-    const fourDecimalNumbers = html.match(/\d+\.\d{4}/g) || [];
-    debugLog({
-      '===找到的四位小数数字': fourDecimalNumbers
-    });
-
-    // 策略2: 寻找净值相关的模式
-    const netValuePatterns = [
-      /(?:最新净值|净值|单位净值|累计净值)[:：\s]*(\d+\.\d{2,4})/gi,
-      /(\d+\.\d{4})\s*\|\s*[-+]?\d+\.\d{2}%/g,
-      /class="[^"]*(?:net|value|price)[^"]*"[^>]*>.*?(\d+\.\d{2,4})/gi,
-      /"(?:netValue|unitNetValue|accumulatedNetValue)"[^>]*>.*?(\d+\.\d{2,4})/gi
-    ];
-
-    const foundValues = [];
-    
-    for (const pattern of netValuePatterns) {
-      let match;
-      while ((match = pattern.exec(html)) !== null) {
-        const value = parseFloat(match[1]);
-        if (!isNaN(value) && value > 0.5 && value < 20) {
-          foundValues.push({
-            value: value,
-            pattern: pattern.toString(),
-            context: match[0]
-          });
-          debugLog({
-            '===找到净值候选': value,
-            '===匹配模式': pattern.toString(),
-            '===上下文': match[0]
-          });
-        }
-      }
-    }
-
-    // 策略3: 在关键词附近搜索数字
-    const keywordPatterns = [
-      /最新净值[^0-9]*(\d+\.\d{2,4})/gi,
-      /单位净值[^0-9]*(\d+\.\d{2,4})/gi,
-      /净值[^0-9]*(\d+\.\d{2,4})/gi
-    ];
-
-    for (const pattern of keywordPatterns) {
-      let match;
-      while ((match = pattern.exec(html)) !== null) {
-        const value = parseFloat(match[1]);
-        if (!isNaN(value) && value > 0.5 && value < 20) {
-          foundValues.push({
-            value: value,
-            pattern: pattern.toString(),
-            context: match[0]
-          });
-        }
-      }
-    }
-
-    // 选择最合理的净值
-    if (foundValues.length > 0) {
-      // 优先选择在合理范围内的值
-      const reasonableValues = foundValues.filter(item => item.value >= 0.5 && item.value <= 20);
-      if (reasonableValues.length > 0) {
-        // 选择最常见的值或第一个合理值
-        netValue = reasonableValues[0].value;
-        debugLog({
-          '===选择净值': netValue,
-          '===选择原因': '第一个合理值'
-        });
-      }
-    }
-
-    // 解析日期
-    let valueDate = '';
-    const datePatterns = [
-      /(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/g,
-      /(\d{4}年\d{1,2}月\d{1,2}日)/g,
-      /更新时间[^0-9]*(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/gi,
-      /净值日期[^0-9]*(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/gi
-    ];
-
-    for (const pattern of datePatterns) {
-      const dateMatch = html.match(pattern);
-      if (dateMatch && dateMatch[1]) {
-        valueDate = dateMatch[1].replace(/年|月/g, '-').replace(/日/g, '').replace(/\//g, '-');
-        break;
-      }
-    }
-    
-    // 如果没有找到日期，使用当前日期
-    if (!valueDate) {
-      const now = new Date();
-      valueDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-    }
+    const html = await fetchFundData(fundCode);
+    const fundName = parseFundName(html, fundCode);
+    const netValue = parseFundPrice(html);
+    const valueDate = parseFundDate(html);
     
     debugLog({
       '===基金解析最终结果': {
@@ -340,7 +453,6 @@ async function queryFund(fundCode: string, context: any, debugLog: Function): Pr
       }
     });
 
-    // 验证数据完整性
     if (!fundName || fundName.trim() === '') {
       return {
         code: FieldCode.Error,
@@ -349,23 +461,21 @@ async function queryFund(fundCode: string, context: any, debugLog: Function): Pr
       };
     }
 
-    // 价格获取失败时设为-1，但不返回错误
     if (netValue === -1) {
       debugLog({
         '===基金净值获取失败，设为-1': fundCode
       });
     }
 
-    // 验证是否获取到有效数据
     const hasValidData = fundName && fundName !== `基金${fundCode}` && netValue > 0;
 
     return {
       code: FieldCode.Success,
       data: {
-        id: `fund_${fundCode}_${Math.random()}`,
+        id: `fund_${fundCode}_${Date.now()}`,
         symbol: fundCode,
         name: fundName,
-        price: netValue, // 失败时为-1
+        price: netValue,
         date: valueDate,
       },
       hasValidData: hasValidData
@@ -383,6 +493,7 @@ async function queryFund(fundCode: string, context: any, debugLog: Function): Pr
   }
 }
 
+// 优化后的股票查询函数 - 不使用硬编码映射
 async function queryStock(stockCode: string, context: any, debugLog: Function): Promise<{
   code: FieldCode;
   data?: any;
@@ -394,131 +505,67 @@ async function queryStock(stockCode: string, context: any, debugLog: Function): 
     });
 
     const symbol = stockCode.toLowerCase();
-    const response = await fetch(`https://qt.gtimg.cn/q=${symbol}`, {
+    
+    // 使用优化的网络请求
+    const response = await fetchWithRetry(`https://qt.gtimg.cn/q=${symbol}`, {
       headers: {
         'Referer': 'https://finance.qq.com/',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     });
 
-    if (!response.ok) {
+    const arrayBuffer = await response.arrayBuffer();
+    
+    // 使用简化的编码处理
+    const stockName = decodeStockName(arrayBuffer);
+    
+    if (!stockName) {
       return {
         code: FieldCode.Error,
-        message: `股票代码 ${stockCode} 网络请求失败: ${response.status}`
+        message: `股票代码 ${stockCode} 无法解析股票名称`
       };
     }
 
-    const text = await response.text();
-    debugLog({
-      '===股票API响应': text
-    });
-
-    if (!text || text.trim() === '') {
-      return {
-        code: FieldCode.Error,
-        message: `股票代码 ${stockCode} 返回空数据`
-      };
-    }
-
-    // 解析返回的数据
+    // 解析数据
+    const decoder = new TextDecoder('gbk');
+    const text = decoder.decode(arrayBuffer);
     const dataMatch = text.match(/="([^"]+)"/);
+    
     if (!dataMatch || !dataMatch[1]) {
       return {
         code: FieldCode.Error,
-        message: `股票代码 ${stockCode} 数据格式异常`
+        message: `股票代码 ${stockCode} 数据格式错误`
       };
     }
 
-    const dataStr = dataMatch[1];
-    const dataArr = dataStr.split('~');
+    const dataArr = dataMatch[1].split('~');
     
-    debugLog({
-      '===股票数据数组': dataArr,
-      '===数组长度': dataArr.length
-    });
-
-    // 数据字段不足时，price设为-2，但仍返回成功
     if (dataArr.length < 4) {
-      debugLog({
-        '===股票数据字段不足，price设为-2': stockCode
-      });
-      
-      // 获取日期信息，使用当前日期
-      const now = new Date();
-      const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-      
-      return {
-        code: FieldCode.Success,
-        data: {
-          id: `stock_${symbol}_${Math.random()}`,
-          symbol: symbol,
-          name: `${stockCode}(数据字段不足)`,
-          price: -2, // 数据字段不足时设为-2
-          date: dateStr,
-        }
-      };
-    }
-
-    // 获取股票名称
-    let stockName = dataArr[1] || '';
-    
-    if (!stockName || stockName.trim() === '') {
       return {
         code: FieldCode.Error,
-        message: `股票代码 ${stockCode} 无法获取股票名称`
+        message: `股票代码 ${stockCode} 数据不完整`
       };
     }
 
-    // 检查价格数据 - 失败时设为-1
-    const priceStr = dataArr[3] || '0';
-    let price = parseFloat(priceStr);
-    if (isNaN(price) || price <= 0) {
-      debugLog({
-        '===股票价格获取失败，设为-1': stockCode,
-        '===原始价格数据': priceStr
-      });
-      price = -1; // 价格获取失败时设为-1
-    }
+    const price = parseFloat(dataArr[3]) || -1;
+    const actualTradeDate = getActualTradeDate(dataArr);
 
-    // 处理中文编码问题
-    if (stockName.includes('�') || /[^\u4e00-\u9fa5a-zA-Z0-9\s\(\)（）]/.test(stockName)) {
-      debugLog({
-        '===检测到乱码股票名称': stockName
-      });
-      
-      try {
-        const gbkDecoder = new TextDecoder('gbk');
-        const encoder = new TextEncoder();
-        const bytes = encoder.encode(stockName);
-        const correctedName = gbkDecoder.decode(new Uint8Array(bytes));
-        
-        if (correctedName && correctedName !== stockName && !correctedName.includes('�')) {
-          stockName = correctedName;
-          debugLog({
-            '===成功修复股票名称': stockName
-          });
-        }
-      } catch (e) {
-        debugLog({
-          '===名称修复失败': String(e)
-        });
-        // 如果修复失败，但有价格数据，仍然返回结果，只是名称可能有问题
-        stockName = `${stockCode}(名称解析异常)`;
+    debugLog({
+      '===股票解析最终结果': {
+        name: stockName,
+        price: price,
+        date: actualTradeDate
       }
-    }
-
-    // 获取日期信息，使用当前日期
-    const now = new Date();
-    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    });
 
     return {
       code: FieldCode.Success,
       data: {
-        id: `stock_${symbol}_${Math.random()}`,
-        symbol: symbol,
+        id: `stock_${stockCode}_${Date.now()}`,
+        symbol: stockCode,
         name: stockName,
-        price: price, // 失败时为-1
-        date: dateStr,
+        price: price,
+        date: actualTradeDate,
       }
     };
 
@@ -526,6 +573,7 @@ async function queryStock(stockCode: string, context: any, debugLog: Function): 
     debugLog({
       '===股票查询异常': String(error)
     });
+    
     return {
       code: FieldCode.Error,
       message: `股票查询异常: ${String(error)}`
