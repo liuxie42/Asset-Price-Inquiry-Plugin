@@ -200,15 +200,21 @@ async function fetchWithRetry(url: string, options: RequestInit = {}): Promise<R
     
     for (let attempt = 1; attempt <= CONFIG.RETRY_COUNT; attempt++) {
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
+        // 兼容性处理：检查 AbortController 是否可用
+        let timeoutId: NodeJS.Timeout | null = null;
+        let requestOptions = { ...options };
         
-        const response = await fetch(url, {
-          ...options,
-          signal: controller.signal
-        });
+        if (typeof AbortController !== 'undefined') {
+          const controller = new AbortController();
+          timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
+          requestOptions.signal = controller.signal;
+        }
         
-        clearTimeout(timeoutId);
+        const response = await fetch(url, requestOptions);
+        
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
         
         if (response.ok) {
           return response;
