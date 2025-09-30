@@ -20,23 +20,152 @@ interface CacheItem {
   hitCount?: number;
 }
 
-// ==================== 配置常量 ====================
+// ==================== 高性能LRU缓存实现 ====================
+class HighPerformanceLRUCache<T> {
+  private cache = new Map<string, { value: T; timestamp: number; accessCount: number }>();
+  private maxSize: number;
+  private hitCount = 0;
+  private missCount = 0;
+
+  constructor(maxSize: number = 1000) {
+    this.maxSize = maxSize;
+  }
+
+  set(key: string, value: T): void {
+    if (this.cache.has(key)) {
+      const item = this.cache.get(key)!;
+      item.value = value;
+      item.timestamp = Date.now();
+      item.accessCount++;
+      this.cache.delete(key);
+      this.cache.set(key, item);
+    } else {
+      if (this.cache.size >= this.maxSize) {
+        const firstKey = this.cache.keys().next().value;
+        this.cache.delete(firstKey);
+      }
+      this.cache.set(key, {
+        value,
+        timestamp: Date.now(),
+        accessCount: 1
+      });
+    }
+  }
+
+  get(key: string, ttl: number): T | null {
+    const item = this.cache.get(key);
+    if (!item) {
+      this.missCount++;
+      return null;
+    }
+
+    if (Date.now() - item.timestamp > ttl) {
+      this.cache.delete(key);
+      this.missCount++;
+      return null;
+    }
+
+    item.accessCount++;
+    item.timestamp = Date.now();
+    this.cache.delete(key);
+    this.cache.set(key, item);
+    
+    this.hitCount++;
+    return item.value;
+  }
+
+  clear(): void {
+    this.cache.clear();
+    this.hitCount = 0;
+    this.missCount = 0;
+  }
+
+  getStats() {
+    const total = this.hitCount + this.missCount;
+    return {
+      size: this.cache.size,
+      hitRate: total > 0 ? (this.hitCount / total * 100).toFixed(2) + '%' : '0%',
+      hitCount: this.hitCount,
+      missCount: this.missCount
+    };
+  }
+
+  // 添加缓存清理方法
+  cleanup(ttl: number): void {
+    const now = Date.now();
+    for (const [key, item] of this.cache.entries()) {
+      if (now - item.timestamp > ttl) {
+        this.cache.delete(key);
+      }
+    }
+  }
+}
+
+// ==================== 优化后的配置常量 ====================
 const CONFIG = {
   PRICE_RANGE: { MIN: 0.01, MAX: 10000 },
-  REQUEST_TIMEOUT: 10000,
-  RETRY_COUNT: 3,
-  RETRY_DELAY: 1000,
+  REQUEST_TIMEOUT: 8000,
+  RETRY_COUNT: 2,
+  RETRY_DELAY: 500,
   PRICE_UNAVAILABLE: null,
-  CACHE_TTL: 60000,  // 缓存1分钟
-  BATCH_CACHE_TTL: 300000,  // 批量查询缓存5分钟
-  MAX_CACHE_SIZE: 1000,     // 最大缓存条目数
-  CACHE_CLEANUP_INTERVAL: 300000, // 5分钟清理一次缓存
+  CACHE_TTL: 45000,
+  BATCH_CACHE_TTL: 180000,
+  MAX_CACHE_SIZE: 500,
+  CACHE_CLEANUP_INTERVAL: 120000,
+  BATCH_DELAY: 20,
+  MAX_CONCURRENT_REQUESTS: 5,
 };
 
-// ==================== 缓存系统 ====================
-const requestCache = new Map<string, CacheItem>();
-const batchResultCache = new Map<string, CacheItem>();
+// ==================== 优化后的缓存系统 ====================
+const requestCache = new HighPerformanceLRUCache<any>(CONFIG.MAX_CACHE_SIZE);
+const batchResultCache = new HighPerformanceLRUCache<any>(CONFIG.MAX_CACHE_SIZE);
 const pendingRequests = new Map<string, Promise<any>>();
+
+// 请求去重和并发控制
+let activeRequestCount = 0;
+const requestQueue: Array<() => Promise<any>> = [];
+
+// 并发控制函数 - 添加性能监控
+async function executeWithConcurrencyControl<T>(task: () => Promise<T>): Promise<T> {
+  const startTime = Date.now();
+  
+  return new Promise((resolve, reject) => {
+    const wrappedTask = async () => {
+      try {
+        activeRequestCount++;
+        performanceMonitor.updateConcurrencyMetrics(activeRequestCount, requestQueue.length);
+        
+        const result = await task();
+        performanceMonitor.recordRequest(startTime, true);
+        resolve(result);
+      } catch (error) {
+        performanceMonitor.recordRequest(startTime, false);
+        reject(error);
+      } finally {
+        activeRequestCount--;
+        performanceMonitor.updateConcurrencyMetrics(activeRequestCount, requestQueue.length);
+        processQueue();
+      }
+    };
+
+    if (activeRequestCount < CONFIG.MAX_CONCURRENT_REQUESTS) {
+      wrappedTask();
+    } else {
+      requestQueue.push(wrappedTask);
+      performanceMonitor.updateConcurrencyMetrics(activeRequestCount, requestQueue.length);
+    }
+  });
+}
+
+// 处理队列中的请求
+function processQueue(): void {
+  while (requestQueue.length > 0 && activeRequestCount < CONFIG.MAX_CONCURRENT_REQUESTS) {
+    const nextTask = requestQueue.shift();
+    if (nextTask) {
+      nextTask();
+    }
+  }
+}
 
 // 预编译正则表达式
 const PATTERNS = {
@@ -57,67 +186,48 @@ const PATTERNS = {
 // ==================== 工具函数 ====================
 // 缓存清理函数
 function cleanExpiredCache(): void {
-  const now = Date.now();
-  
-  // 清理请求缓存
-  for (const [key, value] of requestCache.entries()) {
-    if (now - value.timestamp > CONFIG.CACHE_TTL) {
-      requestCache.delete(key);
-    }
-  }
-  
-  // 清理批量结果缓存
-  for (const [key, value] of batchResultCache.entries()) {
-    if (now - value.timestamp > CONFIG.BATCH_CACHE_TTL) {
-      batchResultCache.delete(key);
-    }
-  }
-  
-  // 限制缓存大小
-  if (requestCache.size > CONFIG.MAX_CACHE_SIZE) {
-    const entries = Array.from(requestCache.entries());
-    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
-    const toDelete = entries.slice(0, Math.floor(CONFIG.MAX_CACHE_SIZE * 0.2));
-    toDelete.forEach(([key]) => requestCache.delete(key));
-  }
+  requestCache.cleanup(CONFIG.CACHE_TTL);
+  batchResultCache.cleanup(CONFIG.BATCH_CACHE_TTL);
 }
 
 // 启动定期缓存清理
 setInterval(cleanExpiredCache, CONFIG.CACHE_CLEANUP_INTERVAL);
 
-// 网络请求函数 - 带重试机制
+// 网络请求函数 - 带重试机制和并发控制
 async function fetchWithRetry(url: string, options: RequestInit = {}): Promise<Response> {
-  let lastError: Error;
-  
-  for (let attempt = 1; attempt <= CONFIG.RETRY_COUNT; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
-      
-      const response = await fetch(url, {
-        ...options,
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (response.ok) {
-        return response;
-      }
-      
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      
-    } catch (error) {
-      lastError = error as Error;
-      
-      if (attempt < CONFIG.RETRY_COUNT) {
-        const delay = CONFIG.RETRY_DELAY * Math.pow(2, attempt - 1);
-        await new Promise(resolve => setTimeout(resolve, delay));
+  return executeWithConcurrencyControl(async () => {
+    let lastError: Error;
+    
+    for (let attempt = 1; attempt <= CONFIG.RETRY_COUNT; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
+        
+        const response = await fetch(url, {
+          ...options,
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (response.ok) {
+          return response;
+        }
+        
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        
+      } catch (error) {
+        lastError = error as Error;
+        
+        if (attempt < CONFIG.RETRY_COUNT) {
+          const delay = CONFIG.RETRY_DELAY * Math.pow(2, attempt - 1);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
     }
-  }
-  
-  throw lastError!;
+    
+    throw lastError!;
+  });
 }
 
 // 请求去重函数
@@ -128,9 +238,9 @@ async function fetchWithDeduplication(url: string, options: RequestInit = {}): P
     return await pendingRequests.get(cacheKey)!;
   }
   
-  const cached = requestCache.get(cacheKey);
-  if (cached && (Date.now() - cached.timestamp) < CONFIG.CACHE_TTL) {
-    return cached.data;
+  const cached = requestCache.get(cacheKey, CONFIG.CACHE_TTL);
+  if (cached) {
+    return cached;
   }
   
   const requestPromise = (async () => {
@@ -138,10 +248,7 @@ async function fetchWithDeduplication(url: string, options: RequestInit = {}): P
       const response = await fetchWithRetry(url, options);
       const text = await response.text();
       
-      requestCache.set(cacheKey, {
-        data: text,
-        timestamp: Date.now()
-      });
+      requestCache.set(cacheKey, text);
       
       return text;
     } finally {
@@ -201,17 +308,44 @@ function isValidStockName(name: string): boolean {
 }
 
 // ==================== 解析函数 ====================
-// 基金名称解析
+// 基金名称解析 - 优化版本
 function parseFundName(html: string, fundCode: string): string {
-  const namePatterns = [
-    /<title>([^<]+?)(?:\s*\([^)]*\))?\s*(?:基金|净值).*?<\/title>/i,
-    /<h1[^>]*>([^<]+?)<\/h1>/i,
-  ];
+  // 使用 indexOf 替代正则表达式进行初步筛选
+  const titleStart = html.indexOf('<title>');
+  const titleEnd = html.indexOf('</title>');
+  
+  if (titleStart !== -1 && titleEnd !== -1) {
+    const titleContent = html.substring(titleStart + 7, titleEnd);
+    
+    // 查找基金名称的关键词位置
+    const fundIndex = titleContent.indexOf('基金');
+    const netValueIndex = titleContent.indexOf('净值');
+    
+    if (fundIndex !== -1 || netValueIndex !== -1) {
+      // 提取基金名称部分
+      let name = titleContent;
+      
+      // 移除括号内容
+      const parenStart = name.indexOf('(');
+      if (parenStart !== -1) {
+        name = name.substring(0, parenStart);
+      }
+      
+      name = name.trim();
+      if (name && name !== `基金${fundCode}`) {
+        return name;
+      }
+    }
+  }
 
-  for (const pattern of namePatterns) {
-    const match = html.match(pattern);
-    if (match?.[1]) {
-      const name = match[1].trim();
+  // 备用方案：查找 h1 标签
+  const h1Start = html.indexOf('<h1');
+  if (h1Start !== -1) {
+    const h1ContentStart = html.indexOf('>', h1Start) + 1;
+    const h1End = html.indexOf('</h1>', h1ContentStart);
+    
+    if (h1ContentStart > 0 && h1End !== -1) {
+      const name = html.substring(h1ContentStart, h1End).trim();
       if (name && name !== `基金${fundCode}`) {
         return name;
       }
@@ -221,29 +355,61 @@ function parseFundName(html: string, fundCode: string): string {
   return `基金${fundCode}`;
 }
 
-// 基金价格解析
+// 基金价格解析 - 优化版本
 function parseFundPrice(html: string): number {
-  const pricePatterns = [
-    /单位净值[^0-9]*(\d+\.\d{2,4})/i,
-    /最新净值[^0-9]*(\d+\.\d{2,4})/i,
-    PATTERNS.PRICE_PATTERN
-  ];
-
-  for (const pattern of pricePatterns) {
-    const matches = html.match(pattern);
-    if (matches?.[1]) {
-      const price = parseFloat(matches[1]);
-      if (!isNaN(price) && price >= CONFIG.PRICE_RANGE.MIN && price <= CONFIG.PRICE_RANGE.MAX) {
-        return price;
+  // 使用 indexOf 查找关键词位置
+  const keywords = ['单位净值', '最新净值'];
+  
+  for (const keyword of keywords) {
+    const keywordIndex = html.indexOf(keyword);
+    if (keywordIndex !== -1) {
+      // 在关键词后查找数字
+      const searchStart = keywordIndex + keyword.length;
+      const searchText = html.substring(searchStart, searchStart + 50); // 限制搜索范围
+      
+      // 查找价格模式
+      const match = searchText.match(/(\d+\.\d{2,4})/);
+      if (match?.[1]) {
+        const price = parseFloat(match[1]);
+        if (!isNaN(price) && price >= CONFIG.PRICE_RANGE.MIN && price <= CONFIG.PRICE_RANGE.MAX) {
+          return price;
+        }
       }
+    }
+  }
+  
+  // 备用方案：使用正则表达式
+  const priceMatch = html.match(PATTERNS.PRICE_PATTERN);
+  if (priceMatch?.[1]) {
+    const price = parseFloat(priceMatch[1]);
+    if (!isNaN(price) && price >= CONFIG.PRICE_RANGE.MIN && price <= CONFIG.PRICE_RANGE.MAX) {
+      return price;
     }
   }
   
   return -1;
 }
 
-// 基金日期解析
+// 基金日期解析 - 优化版本
 function parseFundDate(html: string): string {
+  // 使用 indexOf 查找日期关键词
+  const dateKeywords = ['更新时间', '净值日期'];
+  
+  for (const keyword of dateKeywords) {
+    const keywordIndex = html.indexOf(keyword);
+    if (keywordIndex !== -1) {
+      const searchStart = keywordIndex + keyword.length;
+      const searchText = html.substring(searchStart, searchStart + 30);
+      
+      // 查找日期格式
+      const dateMatch = searchText.match(/(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/);
+      if (dateMatch?.[1]) {
+        return dateMatch[1].replace(/\//g, '-');
+      }
+    }
+  }
+  
+  // 备用方案：查找任何日期格式
   for (const pattern of PATTERNS.DATE_PATTERNS) {
     const dateMatch = html.match(pattern);
     if (dateMatch?.[1]) {
@@ -266,30 +432,9 @@ function getActualTradeDate(dataArr: string[]): string {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 }
 
-// 股票名称提取
-function extractStockNameFromQtData(dataArr: string[], stockCode: string, debugLog: Function): string {
-  if (dataArr.length < 2) {
-    debugLog({
-      '===数据不足': {
-        数组长度: dataArr.length,
-        需要最少: 2
-      }
-    });
-    return '';
-  }
-  
-  debugLog({
-    '===腾讯API数据解析': {
-      总字段数: dataArr.length,
-      '索引0_未知': dataArr[0] || 'undefined',
-      '索引1_名字': dataArr[1] || 'undefined', 
-      '索引2_代码': dataArr[2] || 'undefined',
-      '索引3_当前价格': dataArr[3] || 'undefined',
-      '索引4_昨收': dataArr[4] || 'undefined',
-      '索引5_今开': dataArr[5] || 'undefined',
-      '索引6_成交量': dataArr[6] || 'undefined'
-    }
-  });
+// 股票名称提取 - 优化版本
+function extractStockNameFromQtData(dataArr: string[]): string {
+  if (dataArr.length < 2) return '';
   
   const stockName = dataArr[1]?.trim();
   
@@ -300,75 +445,40 @@ function extractStockNameFromQtData(dataArr: string[], stockCode: string, debugL
     }
     
     if (isValidStockName(cleanedName)) {
-      debugLog({
-        '===名称解析成功': {
-          原始名称: stockName,
-          清理后名称: cleanedName,
-          长度: cleanedName.length
-        }
-      });
       return cleanedName;
     }
   }
   
-  debugLog({
-    '===名称解析失败': {
-      原始名称: stockName,
-      原因: '名称为空或格式无效'
-    }
-  });
-  
   return '';
 }
 
-// 价格提取
-function extractPriceFromQtData(dataArr: string[], debugLog: Function): number {
-  if (dataArr.length < 4) {
-    debugLog({
-      '===价格数据不足': {
-        数组长度: dataArr.length,
-        需要最少: 4
-      }
-    });
-    return 0;
-  }
+// 价格提取 - 优化版本
+function extractPriceFromQtData(dataArr: string[]): number {
+  if (dataArr.length < 4) return 0;
   
   const priceStr = dataArr[3]?.trim();
   
   if (priceStr) {
     const price = parseFloat(priceStr);
     if (!isNaN(price) && price > 0) {
-      debugLog({
-        '===价格解析成功': {
-          原始价格字符串: priceStr,
-          解析后价格: price
-        }
-      });
       return price;
     }
   }
   
-  debugLog({
-    '===价格解析失败': {
-      原始价格字符串: priceStr,
-      原因: '价格为空或无效'
-    }
-  });
-  
   return 0;
 }
 
-// 股票数据解析
-function parseStockDataFromQtGtimg(responseText: string, stockCode: string, debugLog: Function): {
+// 股票数据解析 - 优化版本
+function parseStockDataFromQtGtimg(responseText: string): {
   name: string;
   price: number;
   success: boolean;
   error?: string;
 } {
   try {
-    const variableMatch = responseText.match(/v_s_[^=]+="([^"]+)"/);
-    
-    if (!variableMatch?.[1]) {
+    // 使用 indexOf 查找变量定义的位置
+    const varStart = responseText.indexOf('v_s_');
+    if (varStart === -1) {
       return {
         name: '',
         price: 0,
@@ -377,7 +487,22 @@ function parseStockDataFromQtGtimg(responseText: string, stockCode: string, debu
       };
     }
 
-    const dataArr = variableMatch[1].split('~');
+    // 查找等号和引号的位置
+    const equalIndex = responseText.indexOf('=', varStart);
+    const quoteStart = responseText.indexOf('"', equalIndex);
+    const quoteEnd = responseText.indexOf('"', quoteStart + 1);
+    
+    if (equalIndex === -1 || quoteStart === -1 || quoteEnd === -1) {
+      return {
+        name: '',
+        price: 0,
+        success: false,
+        error: '数据格式不匹配'
+      };
+    }
+
+    const dataString = responseText.substring(quoteStart + 1, quoteEnd);
+    const dataArr = dataString.split('~');
     
     if (dataArr.length < 4) {
       return {
@@ -388,8 +513,8 @@ function parseStockDataFromQtGtimg(responseText: string, stockCode: string, debu
       };
     }
 
-    const stockName = extractStockNameFromQtData(dataArr, stockCode, debugLog);
-    const price = extractPriceFromQtData(dataArr, debugLog);
+    const stockName = extractStockNameFromQtData(dataArr);
+    const price = extractPriceFromQtData(dataArr);
     
     if (!stockName) {
       return {
@@ -418,24 +543,12 @@ function parseStockDataFromQtGtimg(responseText: string, stockCode: string, debu
 
 // ==================== 查询函数 ====================
 // 基金查询
-async function queryFund(fundCode: string, context: any, debugLog: Function): Promise<QueryResult> {
+async function queryFund(fundCode: string): Promise<QueryResult> {
   try {
-    debugLog({
-      '===开始查询基金': fundCode
-    });
-
     const html = await fetchFundData(fundCode);
     const fundName = parseFundName(html, fundCode);
     const netValue = parseFundPrice(html);
     const valueDate = parseFundDate(html);
-    
-    debugLog({
-      '===基金解析最终结果': {
-        name: fundName,
-        netValue: netValue,
-        date: valueDate
-      }
-    });
 
     if (!fundName || fundName.trim() === '') {
       return {
@@ -446,9 +559,7 @@ async function queryFund(fundCode: string, context: any, debugLog: Function): Pr
     }
 
     if (netValue === -1) {
-      debugLog({
-        '===基金净值获取失败，设为-1': fundCode
-      });
+      // 基金净值获取失败，设为-1
     }
 
     const hasValidData = fundName && fundName !== `基金${fundCode}` && netValue > 0;
@@ -466,9 +577,6 @@ async function queryFund(fundCode: string, context: any, debugLog: Function): Pr
     };
 
   } catch (error) {
-    debugLog({
-      '===基金查询异常': String(error)
-    });
     return {
       code: FieldCode.Error,
       message: `基金查询异常: ${String(error)}`,
@@ -478,23 +586,14 @@ async function queryFund(fundCode: string, context: any, debugLog: Function): Pr
 }
 
 // 股票查询
-async function queryStock(stockCode: string, context: any, debugLog: Function): Promise<QueryResult> {
+async function queryStock(stockCode: string): Promise<QueryResult> {
   try {
-    debugLog({
-      '===开始查询股票': stockCode
-    });
-
     const symbol = stockCode;
     let querySymbol = `s_${symbol}`;
     
     if (PATTERNS.FUND_CODE.test(symbol)) {
       querySymbol = `s_sh${symbol}`;
     }
-    
-    debugLog({
-      '===实际查询代码': querySymbol,
-      '===原始输入': stockCode
-    });
     
     const response = await fetchWithRetry(`https://qt.gtimg.cn/q=${querySymbol}`, {
       headers: {
@@ -507,28 +606,18 @@ async function queryStock(stockCode: string, context: any, debugLog: Function): 
     const decoder = new TextDecoder('gbk');
     const text = decoder.decode(arrayBuffer);
     
-    debugLog({
-      '===原始API响应': text
-    });
-    
     if (text.includes('pv_none_match')) {
       if (PATTERNS.FUND_CODE.test(symbol) && querySymbol.includes('sh')) {
-        debugLog({
-          '===sh前缀失败，尝试sz前缀': symbol
-        });
-        return queryStock(`sz${symbol}`, context, debugLog);
+        return queryStock(`sz${symbol}`);
       }
       
-      debugLog({
-        '===API返回无匹配': 'pv_none_match'
-      });
       return {
         code: FieldCode.Error,
         message: `股票代码 ${stockCode} 无法找到匹配数据，请检查代码格式`
       };
     }
 
-    const parseResult = parseStockDataFromQtGtimg(text, stockCode, debugLog);
+    const parseResult = parseStockDataFromQtGtimg(text);
     
     if (!parseResult.success) {
       return {
@@ -540,14 +629,6 @@ async function queryStock(stockCode: string, context: any, debugLog: Function): 
     const variableMatch = text.match(/v_s_[^=]+="([^"]+)"/);
     const dataArr = variableMatch ? variableMatch[1].split('~') : [];
     const actualTradeDate = getActualTradeDate(dataArr);
-
-    debugLog({
-      '===股票解析最终结果': {
-        name: parseResult.name,
-        price: parseResult.price,
-        date: actualTradeDate
-      }
-    });
 
     return {
       code: FieldCode.Success,
@@ -562,10 +643,6 @@ async function queryStock(stockCode: string, context: any, debugLog: Function): 
     };
 
   } catch (error) {
-    debugLog({
-      '===股票查询异常': String(error)
-    });
-    
     return {
       code: FieldCode.Error,
       message: `股票查询异常: ${String(error)}`
@@ -586,7 +663,7 @@ class BatchQueryOptimizer {
     return BatchQueryOptimizer.instance;
   }
 
-  async addQuery(stockCode: string, context: any, debugLog: Function): Promise<QueryResult> {
+  async addQuery(stockCode: string): Promise<QueryResult> {
     return new Promise((resolve, reject) => {
       const normalizedCode = this.normalizeStockCode(stockCode);
       
@@ -595,38 +672,35 @@ class BatchQueryOptimizer {
       }
       
       this.queryQueue.get(normalizedCode)!.push({ resolve, reject });
-      this.scheduleBatchProcess(context, debugLog);
+      this.scheduleBatchProcess();
     });
   }
 
   private normalizeStockCode(code: string): string {
     const trimmed = code.trim();
     
-    // 对于US股票，保持原始大小写
     if (trimmed.toLowerCase().startsWith('us')) {
       return `us${trimmed.substring(2).toUpperCase()}`;
     }
     
-    // 对于6位数字代码，转换为小写
     if (PATTERNS.FUND_CODE.test(trimmed)) {
       return trimmed.toLowerCase();
     }
     
-    // 其他情况转换为小写
     return trimmed.toLowerCase();
   }
 
-  private scheduleBatchProcess(context: any, debugLog: Function): void {
+  private scheduleBatchProcess(): void {
     if (this.processingTimer) {
       clearTimeout(this.processingTimer);
     }
     
     this.processingTimer = setTimeout(() => {
-      this.processBatch(context, debugLog);
-    }, 50);
+      this.processBatch();
+    }, CONFIG.BATCH_DELAY);
   }
 
-  private async processBatch(context: any, debugLog: Function): Promise<void> {
+  private async processBatch(): Promise<void> {
     const currentQueue = new Map(this.queryQueue);
     this.queryQueue.clear();
     this.processingTimer = null;
@@ -634,19 +708,14 @@ class BatchQueryOptimizer {
     const promises = Array.from(currentQueue.entries()).map(async ([stockCode, callbacks]) => {
       try {
         const cacheKey = `batch_${stockCode}`;
-        const cached = batchResultCache.get(cacheKey);
+        const cached = batchResultCache.get(cacheKey, CONFIG.BATCH_CACHE_TTL);
         
         let result: QueryResult;
-        if (cached && (Date.now() - cached.timestamp) < CONFIG.BATCH_CACHE_TTL) {
-          result = cached.data;
-          cached.hitCount = (cached.hitCount || 0) + 1;
+        if (cached) {
+          result = cached;
         } else {
-          result = await this.executeQuery(stockCode, context, debugLog);
-          batchResultCache.set(cacheKey, {
-            data: result,
-            timestamp: Date.now(),
-            hitCount: 1
-          });
+          result = await this.executeQuery(stockCode);
+          batchResultCache.set(cacheKey, result);
         }
         
         callbacks.forEach(callback => callback.resolve(result));
@@ -656,51 +725,24 @@ class BatchQueryOptimizer {
     });
     
     await Promise.all(promises);
-    this.cleanExpiredBatchCache();
   }
 
-  private async executeQuery(stockCode: string, context: any, debugLog: Function): Promise<QueryResult> {
+  private async executeQuery(stockCode: string): Promise<QueryResult> {
     const trimmedCode = stockCode.trim();
-    
-    debugLog({
-      '===批量查询执行': {
-        原始代码: stockCode,
-        处理后代码: trimmedCode
-      }
-    });
     
     // 6位数字代码：基金优先查询逻辑
     if (PATTERNS.FUND_CODE.test(trimmedCode)) {
-      debugLog({
-        '===6位数字代码，优先查询基金': trimmedCode
-      });
-      
-      const fundResult = await queryFund(trimmedCode, context, debugLog);
+      const fundResult = await queryFund(trimmedCode);
       
       if (fundResult.code === FieldCode.Success && fundResult.hasValidData) {
-        debugLog({
-          '===基金查询成功，返回基金数据': trimmedCode
-        });
         return fundResult;
       }
       
-      debugLog({
-        '===基金查询失败或数据无效，尝试股票查询': trimmedCode
-      });
-      return await queryStock(trimmedCode, context, debugLog);
+      return await queryStock(trimmedCode);
     }
     
     // 其他代码直接查询股票
-    return await queryStock(trimmedCode, context, debugLog);
-  }
-
-  private cleanExpiredBatchCache(): void {
-    const now = Date.now();
-    for (const [key, value] of batchResultCache.entries()) {
-      if (now - value.timestamp > CONFIG.BATCH_CACHE_TTL) {
-        batchResultCache.delete(key);
-      }
-    }
+    return await queryStock(trimmedCode);
   }
 }
 
@@ -801,6 +843,21 @@ basekit.addField({
     const { stockCode = '' } = formItemParams;
     const queryDate = new Date().toISOString().split('T')[0];
     
+    // 记录性能指标（每100次请求输出一次）
+    const metrics = performanceMonitor.getMetrics();
+    if (metrics.totalRequests % 100 === 0 && metrics.totalRequests > 0) {
+      console.log('Performance Metrics:', {
+        totalRequests: metrics.totalRequests,
+        successRate: `${((metrics.successfulRequests / metrics.totalRequests) * 100).toFixed(2)}%`,
+        averageResponseTime: `${metrics.averageResponseTime.toFixed(2)}ms`,
+        cacheHitRate: `${metrics.cacheHitRate.toFixed(2)}%`,
+        concurrentRequests: metrics.concurrentRequests,
+        queueLength: metrics.queueLength,
+        requestCacheStats: requestCache.getStats(),
+        batchCacheStats: batchResultCache.getStats()
+      });
+    }
+    
     const validation = validateStockCode(stockCode);
     if (!validation.isValid) {
       return {
@@ -816,18 +873,10 @@ basekit.addField({
       };
     }
 
-    function debugLog(arg: any) {
-      console.log(JSON.stringify({
-        formItemParams,
-        context,
-        arg
-      }));
-    }
-
     try {
       const inputCode = stockCode.trim();
       const optimizer = BatchQueryOptimizer.getInstance();
-      const result = await optimizer.addQuery(inputCode, context, debugLog);
+      const result = await optimizer.addQuery(inputCode);
       
       if (result.code === FieldCode.Success) {
         if (result.data.price <= 0) {
@@ -857,10 +906,6 @@ basekit.addField({
       }
       
     } catch (e) {
-      debugLog({
-        '===异常错误': String(e)
-      });
-      
       return {
         code: FieldCode.Success,
         data: {
@@ -875,5 +920,95 @@ basekit.addField({
     }
   },
 });
+
+// ==================== 性能监控 ====================
+interface PerformanceMetrics {
+  totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  averageResponseTime: number;
+  cacheHitRate: number;
+  concurrentRequests: number;
+  queueLength: number;
+  lastResetTime: number;
+}
+
+class PerformanceMonitor {
+  private static instance: PerformanceMonitor;
+  private metrics: PerformanceMetrics = {
+    totalRequests: 0,
+    successfulRequests: 0,
+    failedRequests: 0,
+    averageResponseTime: 0,
+    cacheHitRate: 0,
+    concurrentRequests: 0,
+    queueLength: 0,
+    lastResetTime: Date.now()
+  };
+  private responseTimes: number[] = [];
+
+  static getInstance(): PerformanceMonitor {
+    if (!PerformanceMonitor.instance) {
+      PerformanceMonitor.instance = new PerformanceMonitor();
+    }
+    return PerformanceMonitor.instance;
+  }
+
+  recordRequest(startTime: number, success: boolean): void {
+    const responseTime = Date.now() - startTime;
+    this.responseTimes.push(responseTime);
+    
+    // 保持最近100个响应时间记录
+    if (this.responseTimes.length > 100) {
+      this.responseTimes.shift();
+    }
+
+    this.metrics.totalRequests++;
+    if (success) {
+      this.metrics.successfulRequests++;
+    } else {
+      this.metrics.failedRequests++;
+    }
+
+    // 计算平均响应时间
+    this.metrics.averageResponseTime = 
+      this.responseTimes.reduce((sum, time) => sum + time, 0) / this.responseTimes.length;
+  }
+
+  updateConcurrencyMetrics(activeCount: number, queueLength: number): void {
+    this.metrics.concurrentRequests = activeCount;
+    this.metrics.queueLength = queueLength;
+  }
+
+  updateCacheMetrics(): void {
+    const requestCacheStats = requestCache.getStats();
+    const batchCacheStats = batchResultCache.getStats();
+    
+    // 计算综合缓存命中率
+    const totalHits = parseFloat(requestCacheStats.hitRate) + parseFloat(batchCacheStats.hitRate);
+    this.metrics.cacheHitRate = totalHits / 2;
+  }
+
+  getMetrics(): PerformanceMetrics {
+    this.updateCacheMetrics();
+    return { ...this.metrics };
+  }
+
+  reset(): void {
+    this.metrics = {
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      averageResponseTime: 0,
+      cacheHitRate: 0,
+      concurrentRequests: activeRequestCount,
+      queueLength: requestQueue.length,
+      lastResetTime: Date.now()
+    };
+    this.responseTimes = [];
+  }
+}
+
+const performanceMonitor = PerformanceMonitor.getInstance();
 
 export default basekit;
