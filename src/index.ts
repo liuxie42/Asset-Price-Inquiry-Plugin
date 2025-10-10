@@ -200,21 +200,15 @@ async function fetchWithRetry(url: string, options: RequestInit = {}): Promise<R
     
     for (let attempt = 1; attempt <= CONFIG.RETRY_COUNT; attempt++) {
       try {
-        // 兼容性处理：检查 AbortController 是否可用
-        let timeoutId: NodeJS.Timeout | null = null;
-        let requestOptions = { ...options };
+        // 使用 Promise.race 实现超时，避免 AbortController 兼容性问题
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            reject(new Error(`Request timeout after ${CONFIG.REQUEST_TIMEOUT}ms`));
+          }, CONFIG.REQUEST_TIMEOUT);
+        });
         
-        if (typeof AbortController !== 'undefined') {
-          const controller = new AbortController();
-          timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
-          requestOptions.signal = controller.signal;
-        }
-        
-        const response = await fetch(url, requestOptions);
-        
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
+        const fetchPromise = fetch(url, options);
+        const response = await Promise.race([fetchPromise, timeoutPromise]);
         
         if (response.ok) {
           return response;
@@ -287,12 +281,15 @@ function validateStockCode(code: string): { isValid: boolean; type: 'stock' | 'f
     };
   }
   
-  if (PATTERNS.FUND_CODE.test(trimmedCode)) {
-    return { isValid: true, type: 'fund' };
+  // 如果有前缀 sz、sh、hk、us 就认为是股票
+  if (trimmedCode.startsWith('sz') || trimmedCode.startsWith('sh') || 
+      trimmedCode.startsWith('hk') || trimmedCode.startsWith('us')) {
+    return { isValid: true, type: 'stock' };
   }
   
-  if (PATTERNS.STOCK_CODE.test(trimmedCode) || PATTERNS.FUND_CODE.test(trimmedCode)) {
-    return { isValid: true, type: 'stock' };
+  // 如果是纯数字就认为是基金
+  if (/^\d+$/.test(trimmedCode)) {
+    return { isValid: true, type: 'fund' };
   }
   
   return {
@@ -363,33 +360,66 @@ function parseFundName(html: string, fundCode: string): string {
 
 // 基金价格解析 - 优化版本
 function parseFundPrice(html: string): number {
-  // 使用 indexOf 查找关键词位置
-  const keywords = ['单位净值', '最新净值'];
+  // 扩展关键词搜索
+  const keywords = [
+    '单位净值', '最新净值', '净值', 'dwjz', 'nav', 
+    '基金净值', '累计净值', '最新价', '现价', 'unitMoney'
+  ];
   
   for (const keyword of keywords) {
     const keywordIndex = html.indexOf(keyword);
     if (keywordIndex !== -1) {
-      // 在关键词后查找数字
-      const searchStart = keywordIndex + keyword.length;
-      const searchText = html.substring(searchStart, searchStart + 50); // 限制搜索范围
+      const contextStart = Math.max(0, keywordIndex - 50);
+      const contextEnd = Math.min(html.length, keywordIndex + 200);
+      const context = html.substring(contextStart, contextEnd);
       
-      // 查找价格模式
-      const match = searchText.match(/(\d+\.\d{2,4})/);
-      if (match?.[1]) {
-        const price = parseFloat(match[1]);
-        if (!isNaN(price) && price >= CONFIG.PRICE_RANGE.MIN && price <= CONFIG.PRICE_RANGE.MAX) {
+      // 在上下文中查找价格
+      const priceMatch = context.match(/(\d+\.\d{4})/);
+      if (priceMatch) {
+        const price = parseFloat(priceMatch[1]);
+        if (!isNaN(price) && price >= 0.01 && price <= 10000) {
           return price;
         }
       }
     }
   }
   
-  // 备用方案：使用正则表达式
-  const priceMatch = html.match(PATTERNS.PRICE_PATTERN);
-  if (priceMatch?.[1]) {
-    const price = parseFloat(priceMatch[1]);
-    if (!isNaN(price) && price >= CONFIG.PRICE_RANGE.MIN && price <= CONFIG.PRICE_RANGE.MAX) {
-      return price;
+  // 尝试JSON数据解析
+  const jsonMatches = html.match(/"dwjz"[:\s]*"?(\d+\.\d{4})"?/g);
+  if (jsonMatches) {
+    for (const match of jsonMatches) {
+      const priceMatch = match.match(/(\d+\.\d{4})/);
+      if (priceMatch) {
+        const price = parseFloat(priceMatch[1]);
+        if (!isNaN(price) && price >= 0.01 && price <= 10000) {
+          return price;
+        }
+      }
+    }
+  }
+  
+  // 尝试HTML标签内的价格
+  const tagMatches = html.match(/>(\d+\.\d{4})</g);
+  if (tagMatches) {
+    for (const match of tagMatches) {
+      const priceMatch = match.match(/(\d+\.\d{4})/);
+      if (priceMatch) {
+        const price = parseFloat(priceMatch[1]);
+        if (!isNaN(price) && price >= 0.01 && price <= 10000) {
+          return price;
+        }
+      }
+    }
+  }
+  
+  // 备用方案：查找所有合理范围内的4位小数价格
+  const fourDecimalMatches = html.match(/\d+\.\d{4}/g);
+  if (fourDecimalMatches) {
+    for (const priceStr of fourDecimalMatches) {
+      const price = parseFloat(priceStr);
+      if (!isNaN(price) && price >= 0.01 && price <= 10000) {
+        return price;
+      }
     }
   }
   
