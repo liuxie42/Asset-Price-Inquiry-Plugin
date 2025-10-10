@@ -125,25 +125,19 @@ const pendingRequests = new Map<string, Promise<any>>();
 let activeRequestCount = 0;
 const requestQueue: Array<() => Promise<any>> = [];
 
-// 并发控制函数 - 添加性能监控
+// 并发控制函数
 async function executeWithConcurrencyControl<T>(task: () => Promise<T>): Promise<T> {
-  const startTime = Date.now();
-  
   return new Promise((resolve, reject) => {
     const wrappedTask = async () => {
       try {
         activeRequestCount++;
-        performanceMonitor.updateConcurrencyMetrics(activeRequestCount, requestQueue.length);
         
         const result = await task();
-        performanceMonitor.recordRequest(startTime, true);
         resolve(result);
       } catch (error) {
-        performanceMonitor.recordRequest(startTime, false);
         reject(error);
       } finally {
         activeRequestCount--;
-        performanceMonitor.updateConcurrencyMetrics(activeRequestCount, requestQueue.length);
         processQueue();
       }
     };
@@ -152,7 +146,6 @@ async function executeWithConcurrencyControl<T>(task: () => Promise<T>): Promise
       wrappedTask();
     } else {
       requestQueue.push(wrappedTask);
-      performanceMonitor.updateConcurrencyMetrics(activeRequestCount, requestQueue.length);
     }
   });
 }
@@ -358,72 +351,233 @@ function parseFundName(html: string, fundCode: string): string {
   return `基金${fundCode}`;
 }
 
+// 定义基金净值数据接口
+interface FundNetValueData {
+  date: string;
+  netValue: number;
+  source: string;
+  context: string;
+}
+
+
+
+// 单位净值强校验函数
+function validateNetValue(value: string): { isValid: boolean; price: number } {
+  const formatMatch = value.match(/^(\d+\.\d{4})$/);
+  if (!formatMatch) {
+    return { isValid: false, price: -1 };
+  }
+  
+  const price = parseFloat(formatMatch[1]);
+  
+  if (isNaN(price)) {
+    return { isValid: false, price: -1 };
+  }
+  
+  if (price < CONFIG.PRICE_RANGE.MIN || price > CONFIG.PRICE_RANGE.MAX) {
+    return { isValid: false, price: -1 };
+  }
+  
+  return { isValid: true, price };
+}
+
+// 日期格式化函数
+function normalizeDate(dateText: string): string {
+  const currentYear = new Date().getFullYear();
+  
+  if (/^\d{1,2}-\d{1,2}$/.test(dateText)) {
+    const [month, day] = dateText.split('-');
+    return `${currentYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+  }
+  
+  if (/^\d{1,2}\/\d{1,2}$/.test(dateText)) {
+    const [month, day] = dateText.split('/');
+    return `${currentYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+  }
+  
+  return extractDateFromContext(dateText);
+}
+
 // 基金价格解析 - 优化版本
 function parseFundPrice(html: string): number {
-  // 扩展关键词搜索
-  const keywords = [
-    '单位净值', '最新净值', '净值', 'dwjz', 'nav', 
-    '基金净值', '累计净值', '最新价', '现价', 'unitMoney'
-  ];
+  const foundItems: FundNetValueData[] = [];
   
-  for (const keyword of keywords) {
-    const keywordIndex = html.indexOf(keyword);
-    if (keywordIndex !== -1) {
-      const contextStart = Math.max(0, keywordIndex - 50);
-      const contextEnd = Math.min(html.length, keywordIndex + 200);
+  // 策略1：优先查找表格
+  const tableMatches = html.match(/<table[^>]*>[\s\S]*?<\/table>/gi);
+  if (tableMatches) {
+    for (const table of tableMatches) {
+      if (table.includes('单位净值')) {
+        const rows = table.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi);
+        if (!rows) continue;
+        
+        let netValueColumnIndex = -1;
+        
+        // 找到"单位净值"列的索引
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          if (row.includes('单位净值')) {
+            const cells = row.match(/<t[hd][^>]*>[\s\S]*?<\/t[hd]>/gi);
+            if (cells) {
+              for (let j = 0; j < cells.length; j++) {
+                if (cells[j].includes('单位净值')) {
+                  netValueColumnIndex = j;
+                  break;
+                }
+              }
+            }
+            break;
+          }
+        }
+        
+        // 解析数据行
+        if (netValueColumnIndex !== -1) {
+          for (const row of rows) {
+            if (row.includes('单位净值') || row.includes('<th')) continue;
+            
+            const cells = row.match(/<t[hd][^>]*>[\s\S]*?<\/t[hd]>/gi);
+            if (!cells || cells.length <= netValueColumnIndex) continue;
+            
+            const dateText = cells[0].replace(/<[^>]*>/g, '').trim();
+            const priceText = cells[netValueColumnIndex].replace(/<[^>]*>/g, '').trim();
+            
+            const validation = validateNetValue(priceText);
+            if (validation.isValid) {
+              const normalizedDate = normalizeDate(dateText);
+              
+              if (normalizedDate !== 'NO_DATE_FOUND') {
+                foundItems.push({
+                  date: normalizedDate,
+                  netValue: validation.price,
+                  source: 'table_parsing',
+                  context: ''
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  // 策略2：如果表格没找到数据，使用关键词搜索
+  if (foundItems.length === 0) {
+    const keyword = '单位净值';
+    let searchIndex = 0;
+    
+    while (true) {
+      const keywordIndex = html.indexOf(keyword, searchIndex);
+      if (keywordIndex === -1) break;
+      
+      const contextStart = Math.max(0, keywordIndex - 200);
+      const contextEnd = Math.min(html.length, keywordIndex + 500);
       const context = html.substring(contextStart, contextEnd);
       
-      // 在上下文中查找价格
-      const priceMatch = context.match(/(\d+\.\d{4})/);
-      if (priceMatch) {
-        const price = parseFloat(priceMatch[1]);
-        if (!isNaN(price) && price >= 0.01 && price <= 10000) {
-          return price;
+      const priceMatches = context.match(/\d+\.\d{4}/g);
+      if (priceMatches) {
+        for (const priceText of priceMatches) {
+          const validation = validateNetValue(priceText);
+          if (validation.isValid) {
+            const dateFound = extractDateFromContext(context);
+            
+            if (dateFound !== 'NO_DATE_FOUND') {
+              foundItems.push({
+                date: dateFound,
+                netValue: validation.price,
+                source: 'keyword_search',
+                context: ''
+              });
+            }
+          }
         }
       }
+      
+      searchIndex = keywordIndex + 1;
     }
   }
   
-  // 尝试JSON数据解析
-  const jsonMatches = html.match(/"dwjz"[:\s]*"?(\d+\.\d{4})"?/g);
-  if (jsonMatches) {
-    for (const match of jsonMatches) {
-      const priceMatch = match.match(/(\d+\.\d{4})/);
-      if (priceMatch) {
-        const price = parseFloat(priceMatch[1]);
-        if (!isNaN(price) && price >= 0.01 && price <= 10000) {
-          return price;
-        }
-      }
-    }
-  }
-  
-  // 尝试HTML标签内的价格
-  const tagMatches = html.match(/>(\d+\.\d{4})</g);
-  if (tagMatches) {
-    for (const match of tagMatches) {
-      const priceMatch = match.match(/(\d+\.\d{4})/);
-      if (priceMatch) {
-        const price = parseFloat(priceMatch[1]);
-        if (!isNaN(price) && price >= 0.01 && price <= 10000) {
-          return price;
-        }
-      }
-    }
-  }
-  
-  // 备用方案：查找所有合理范围内的4位小数价格
-  const fourDecimalMatches = html.match(/\d+\.\d{4}/g);
-  if (fourDecimalMatches) {
-    for (const priceStr of fourDecimalMatches) {
-      const price = parseFloat(priceStr);
-      if (!isNaN(price) && price >= 0.01 && price <= 10000) {
-        return price;
-      }
-    }
+  // 选择最新日期的净值
+  if (foundItems.length > 0) {
+    foundItems.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    return foundItems[0].netValue;
   }
   
   return -1;
+}
+
+// 辅助函数：从上下文中提取日期（增强版）
+function extractDateFromContext(context: string): string {
+  // 添加调试信息
+  const debugDateInfo = {
+    originalContext: context.substring(0, 200),
+    foundDates: [] as Array<{pattern: string, match: string, normalized: string}>
+  };
+
+  // 尝试多种日期格式，按优先级排序
+  const datePatterns = [
+    { name: 'standard_date', regex: /(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/g },           // 2024-01-15 或 2024/1/15
+    { name: 'chinese_date', regex: /(\d{4}年\d{1,2}月\d{1,2}日)/g },              // 2024年1月15日
+    { name: 'net_value_date', regex: /净值日期[^0-9]*(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/gi },  // 净值日期：2024-01-15
+    { name: 'update_time', regex: /更新时间[^0-9]*(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/gi },   // 更新时间：2024-01-15
+    { name: 'date_label', regex: /日期[^0-9]*(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/gi },        // 日期：2024-01-15
+    { name: 'time_label', regex: /时间[^0-9]*(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/gi },        // 时间：2024-01-15
+    { name: 'short_date', regex: /(\d{1,2}[-\/]\d{1,2})/g },                      // 01-15 或 1/15 (当年)
+    { name: 'timestamp', regex: /(\d{8})/g }                                      // 20241015 格式
+  ];
+  
+  for (const pattern of datePatterns) {
+    let match;
+    pattern.regex.lastIndex = 0; // 重置正则表达式状态
+    
+    while ((match = pattern.regex.exec(context)) !== null) {
+      const dateStr = match[1];
+      let normalizedDate = '';
+      
+      try {
+        if (pattern.name === 'chinese_date') {
+          // 处理中文日期格式
+          normalizedDate = dateStr
+            .replace(/年/g, '-')
+            .replace(/月/g, '-')
+            .replace(/日/g, '');
+        } else if (pattern.name === 'short_date') {
+          // 处理短日期格式，补充当前年份
+          const currentYear = new Date().getFullYear();
+          normalizedDate = `${currentYear}-${dateStr.replace(/\//g, '-')}`;
+        } else if (pattern.name === 'timestamp') {
+          // 处理8位时间戳格式 YYYYMMDD
+          if (dateStr.length === 8) {
+            normalizedDate = `${dateStr.substring(0,4)}-${dateStr.substring(4,6)}-${dateStr.substring(6,8)}`;
+          }
+        } else {
+          // 标准化其他格式
+          normalizedDate = dateStr.replace(/\//g, '-');
+        }
+        
+        // 验证日期有效性
+        const parsedDate = new Date(normalizedDate);
+        if (!isNaN(parsedDate.getTime()) && parsedDate.getFullYear() > 2000 && parsedDate.getFullYear() <= new Date().getFullYear() + 1) {
+          debugDateInfo.foundDates.push({
+            pattern: pattern.name,
+            match: dateStr,
+            normalized: normalizedDate
+          });
+          
+          // 输出日期解析调试信息
+          console.log(`日期解析成功: ${pattern.name} -> ${dateStr} -> ${normalizedDate}`);
+          
+          return normalizedDate;
+        }
+      } catch (error) {
+        console.log(`日期解析失败: ${pattern.name} -> ${dateStr} -> 错误: ${error}`);
+      }
+    }
+  }
+  
+  // 如果没有找到有效日期，不要返回今天的日期，而是返回一个特殊标记
+  console.log(`未找到有效日期，上下文: ${context.substring(0, 100)}...`);
+  console.log(`日期解析调试信息:`, JSON.stringify(debugDateInfo, null, 2));
+  
+  return 'NO_DATE_FOUND';
 }
 
 // 基金日期解析 - 优化版本
@@ -879,20 +1033,7 @@ basekit.addField({
     const { stockCode = '' } = formItemParams;
     const queryDate = new Date().toISOString().split('T')[0];
     
-    // 记录性能指标（每100次请求输出一次）
-    const metrics = performanceMonitor.getMetrics();
-    if (metrics.totalRequests % 100 === 0 && metrics.totalRequests > 0) {
-      console.log('Performance Metrics:', {
-        totalRequests: metrics.totalRequests,
-        successRate: `${((metrics.successfulRequests / metrics.totalRequests) * 100).toFixed(2)}%`,
-        averageResponseTime: `${metrics.averageResponseTime.toFixed(2)}ms`,
-        cacheHitRate: `${metrics.cacheHitRate.toFixed(2)}%`,
-        concurrentRequests: metrics.concurrentRequests,
-        queueLength: metrics.queueLength,
-        requestCacheStats: requestCache.getStats(),
-        batchCacheStats: batchResultCache.getStats()
-      });
-    }
+
     
     const validation = validateStockCode(stockCode);
     if (!validation.isValid) {
@@ -957,94 +1098,6 @@ basekit.addField({
   },
 });
 
-// ==================== 性能监控 ====================
-interface PerformanceMetrics {
-  totalRequests: number;
-  successfulRequests: number;
-  failedRequests: number;
-  averageResponseTime: number;
-  cacheHitRate: number;
-  concurrentRequests: number;
-  queueLength: number;
-  lastResetTime: number;
-}
 
-class PerformanceMonitor {
-  private static instance: PerformanceMonitor;
-  private metrics: PerformanceMetrics = {
-    totalRequests: 0,
-    successfulRequests: 0,
-    failedRequests: 0,
-    averageResponseTime: 0,
-    cacheHitRate: 0,
-    concurrentRequests: 0,
-    queueLength: 0,
-    lastResetTime: Date.now()
-  };
-  private responseTimes: number[] = [];
-
-  static getInstance(): PerformanceMonitor {
-    if (!PerformanceMonitor.instance) {
-      PerformanceMonitor.instance = new PerformanceMonitor();
-    }
-    return PerformanceMonitor.instance;
-  }
-
-  recordRequest(startTime: number, success: boolean): void {
-    const responseTime = Date.now() - startTime;
-    this.responseTimes.push(responseTime);
-    
-    // 保持最近100个响应时间记录
-    if (this.responseTimes.length > 100) {
-      this.responseTimes.shift();
-    }
-
-    this.metrics.totalRequests++;
-    if (success) {
-      this.metrics.successfulRequests++;
-    } else {
-      this.metrics.failedRequests++;
-    }
-
-    // 计算平均响应时间
-    this.metrics.averageResponseTime = 
-      this.responseTimes.reduce((sum, time) => sum + time, 0) / this.responseTimes.length;
-  }
-
-  updateConcurrencyMetrics(activeCount: number, queueLength: number): void {
-    this.metrics.concurrentRequests = activeCount;
-    this.metrics.queueLength = queueLength;
-  }
-
-  updateCacheMetrics(): void {
-    const requestCacheStats = requestCache.getStats();
-    const batchCacheStats = batchResultCache.getStats();
-    
-    // 计算综合缓存命中率
-    const totalHits = parseFloat(requestCacheStats.hitRate) + parseFloat(batchCacheStats.hitRate);
-    this.metrics.cacheHitRate = totalHits / 2;
-  }
-
-  getMetrics(): PerformanceMetrics {
-    this.updateCacheMetrics();
-    return { ...this.metrics };
-  }
-
-  reset(): void {
-    this.metrics = {
-      totalRequests: 0,
-      successfulRequests: 0,
-      failedRequests: 0,
-      averageResponseTime: 0,
-      cacheHitRate: 0,
-      concurrentRequests: activeRequestCount,
-      queueLength: requestQueue.length,
-      lastResetTime: Date.now()
-    };
-    this.responseTimes = [];
-  }
-}
-
-const performanceMonitor = PerformanceMonitor.getInstance();
 
 export default basekit;
