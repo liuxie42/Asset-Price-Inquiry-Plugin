@@ -13,9 +13,7 @@
     "skipLibCheck": true,
     "lib": [
       "ES2020"
-    ],
-    "allowJs": true,
-    "checkJs": true
+    ]
   },
   "include": [
     "src/**/*"

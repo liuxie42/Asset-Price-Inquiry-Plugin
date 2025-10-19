@@ -7,7 +7,8 @@
     "start": "block-basekit-cli start:field",
     "build": "block-basekit-cli build:field",
     "pack": "block-basekit-cli pack:field",
-    "dev": "block-basekit-cli dev:field"
+    "dev": "block-basekit-cli dev:field",
+    "test": "jest"
   },
   "keywords": [
     "stock",
@@ -23,12 +24,30 @@
     "@babel/preset-env": "^7.28.3",
     "@babel/preset-typescript": "^7.27.1",
     "@lark-opdev/block-basekit-cli": "1.0.5",
-    "@types/jest": "^30.0.0",
-    "jest": "^30.2.0",
+    "@types/jest": "^29.5.12",
+    "jest": "^29.7.0",
     "ts-jest": "^29.4.4",
     "typescript": "^5.9.2"
   },
   "dependencies": {
-    "@lark-opdev/block-basekit-server-api": "1.0.6"
+    "@lark-opdev/block-basekit-server-api": "1.0.6",
+    "node-abort-controller": "^3.1.1"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/test/**/*.ts",
+      "**/*.test.ts"
+    ],
+    "modulePathIgnorePatterns": [
+      "<rootDir>/output/"
+    ],
+    "collectCoverageFrom": [
+      "src/**/*.ts"
+    ],
+    "testTimeout": 10000,
+    "forceExit": true,
+    "detectOpenHandles": true
   }
 }

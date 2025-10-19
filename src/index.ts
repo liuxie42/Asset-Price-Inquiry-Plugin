@@ -1,4 +1,11 @@
 import { basekit, FieldType, field, FieldComponent, FieldCode, NumberFormatter } from '@lark-opdev/block-basekit-server-api';
+
+// Node.js 14.21.0 兼容性：添加 AbortController polyfill
+if (typeof globalThis.AbortController === 'undefined') {
+  const { AbortController } = require('node-abort-controller');
+  globalThis.AbortController = AbortController;
+}
+
 const { t } = field;
 
 // ==================== 类型定义 ====================
@@ -177,14 +184,32 @@ const PATTERNS = {
 };
 
 // ==================== 工具函数 ====================
-// 缓存清理函数
+// 缓存清理定时器引用
+let cacheCleanupTimer: NodeJS.Timeout | null = null;
+
+// 清理过期缓存
 function cleanExpiredCache(): void {
   requestCache.cleanup(CONFIG.CACHE_TTL);
   batchResultCache.cleanup(CONFIG.BATCH_CACHE_TTL);
 }
 
 // 启动定期缓存清理
-setInterval(cleanExpiredCache, CONFIG.CACHE_CLEANUP_INTERVAL);
+function startCacheCleanup(): void {
+  if (!cacheCleanupTimer) {
+    cacheCleanupTimer = setInterval(cleanExpiredCache, CONFIG.CACHE_CLEANUP_INTERVAL);
+  }
+}
+
+// 停止缓存清理
+function stopCacheCleanup(): void {
+  if (cacheCleanupTimer) {
+    clearInterval(cacheCleanupTimer);
+    cacheCleanupTimer = null;
+  }
+}
+
+// 在模块加载时启动缓存清理
+startCacheCleanup();
 
 // 网络请求函数 - 带重试机制和并发控制
 async function fetchWithRetry(url: string, options: RequestInit = {}): Promise<Response> {
@@ -263,6 +288,73 @@ async function fetchFundData(fundCode: string): Promise<string> {
 }
 
 // ==================== 验证函数 ====================
+// ==================== 日期验证函数 ====================
+/**
+ * 验证日期格式和有效性
+ * @param dateStr 日期字符串
+ * @returns 验证结果和格式化后的日期
+ */
+function validateQueryDate(dateStr: string): { isValid: boolean; formattedDate: string; message?: string } {
+  if (!dateStr || dateStr.trim() === '') {
+    return {
+      isValid: false,
+      formattedDate: '',
+      message: '请输入查询日期'
+    };
+  }
+
+  const trimmedDate = dateStr.trim();
+  
+  // 支持多种日期格式：YYYY-MM-DD 或 YYYY/MM/DD
+  let normalizedDate = trimmedDate;
+  
+  // 将斜杠格式转换为连字符格式
+  if (trimmedDate.includes('/')) {
+    normalizedDate = trimmedDate.replace(/\//g, '-');
+  }
+  
+  // 检查基本格式 YYYY-MM-DD
+  if (!PATTERNS.DATE_FORMAT.test(normalizedDate)) {
+    return {
+      isValid: false,
+      formattedDate: '',
+      message: '请输入正确的日期格式（YYYY-MM-DD 或 YYYY/MM/DD），如：2024-01-15 或 2024/01/15'
+    };
+  }
+
+  // 验证日期有效性
+  const date = new Date(normalizedDate);
+  if (isNaN(date.getTime())) {
+    return {
+      isValid: false,
+      formattedDate: '',
+      message: '请输入有效的日期'
+    };
+  }
+
+  // 检查日期范围（不能是未来日期，不能早于2000年）
+  const today = new Date();
+  const minDate = new Date('2000-01-01');
+  
+  if (date > today) {
+    return {
+      isValid: false,
+      formattedDate: '',
+      message: '查询日期不能是未来日期'
+    };
+  }
+
+  if (date < minDate) {
+    return {
+      isValid: false,
+      formattedDate: '',
+      message: '查询日期不能早于2000年1月1日'
+    };
+  }
+
+  return { isValid: true, formattedDate: normalizedDate };
+}
+
 function validateStockCode(code: string): { isValid: boolean; type: 'stock' | 'fund' | 'unknown'; message?: string } {
   const trimmedCode = code.trim().toLowerCase();
   
@@ -948,26 +1040,23 @@ basekit.addField({
         'stockCode': '股票/基金代码',
         'stockPrice': '价格/净值',
         'stockName': '名称',
-        'queryDate': '查询日期',
+        'queryDate': '日期',
+        'priceDate': '价格日期',
         'status': '状态',
-        'placeholder': '请输入股票代码（如：sh000001、sz000001、hk00700、usAAPL）或基金代码（如：000311）'
+        'placeholder': '请输入股票代码（如：sh000001、sz000001、hk00700、usAAPL）或基金代码（如：000311）',
+        'datePlaceholder': '请输入日期（YYYY-MM-DD 或 YYYY/MM/DD），如：2024-01-15（仅用于定时自动化，不代表价格查询日期）'
       },
       'en-US': {
         'stockCode': 'Stock/Fund Code',
         'stockPrice': 'Price/NAV',
         'stockName': 'Name',
-        'queryDate': 'Query Date',
+        'queryDate': 'Date',
+        'priceDate': 'Price Date',
         'status': 'Status',
-        'placeholder': 'Enter stock code (e.g. sh000001, sz000001, hk00700, usAAPL) or fund code (e.g. 000311)'
+        'placeholder': 'Enter stock code (e.g. sh000001, sz000001, hk00700, usAAPL) or fund code (e.g. 000311)',
+        'datePlaceholder': 'Enter date (YYYY-MM-DD or YYYY/MM/DD), e.g. 2024-01-15 (for automation only, not query date)'
       },
-      'ja-JP': {
-        'stockCode': '株式/ファンドコード',
-        'stockPrice': '価格/基準価額',
-        'stockName': '名称',
-        'queryDate': 'クエリ日',
-        'status': 'ステータス',
-        'placeholder': '株式コード（例：sh000001、sz000001、hk00700、usAAPL）またはファンドコード（例：000311）を入力してください'
-      },
+
     },
   },
   formItems: [
@@ -977,6 +1066,17 @@ basekit.addField({
       component: FieldComponent.Input,
       props: {
         placeholder: t('placeholder'),
+      },
+      validator: {
+        required: true,
+      },
+    },
+    {
+      key: 'queryDate',
+      label: t('queryDate'),
+      component: FieldComponent.Input,
+      props: {
+        placeholder: t('datePlaceholder'),
       },
       validator: {
         required: true,
@@ -1024,16 +1124,31 @@ basekit.addField({
         {
           key: 'date',
           type: FieldType.Text,
-          label: t('queryDate'),
+          label: t('priceDate'),
         },
       ],
     },
   },
-  execute: async (formItemParams: { stockCode: string }, context) => {
-    const { stockCode = '' } = formItemParams;
-    const queryDate = new Date().toISOString().split('T')[0];
+  execute: async (formItemParams: { stockCode: string; queryDate?: string }, context) => {
+    const { stockCode = '', queryDate = '' } = formItemParams;
     
+    // 验证日期输入
+    const dateValidation = validateQueryDate(queryDate);
+    if (!dateValidation.isValid) {
+      return {
+        code: FieldCode.Success,
+        data: {
+          id: `date_error_${Date.now()}`,
+          status: '失败',
+          symbol: stockCode || '无效代码',
+          name: dateValidation.message || '日期格式错误',
+          price: -1002,
+          date: queryDate || '无效日期'
+        }
+      };
+    }
 
+    const validatedDate = dateValidation.formattedDate;
     
     const validation = validateStockCode(stockCode);
     if (!validation.isValid) {
@@ -1045,7 +1160,7 @@ basekit.addField({
           symbol: stockCode || '无效代码',
           name: validation.message || '请输入有效的股票或基金代码',
           price: -1001,
-          date: queryDate
+          date: validatedDate
         }
       };
     }
@@ -1064,8 +1179,7 @@ basekit.addField({
           code: result.code,
           data: {
             ...result.data,
-            status: '成功',
-            date: queryDate
+            status: '成功'
           }
         };
       } else {
@@ -1077,7 +1191,7 @@ basekit.addField({
             symbol: inputCode,
             name: result.message || '查询失败',
             price: -2002,
-            date: queryDate
+            date: validatedDate
           }
         };
       }
@@ -1091,7 +1205,7 @@ basekit.addField({
           symbol: stockCode || '未知代码',
           name: `系统异常: ${String(e)}`,
           price: -9999,
-          date: queryDate
+          date: validatedDate
         }
       };
     }
@@ -1101,3 +1215,6 @@ basekit.addField({
 
 
 export default basekit;
+
+// 导出清理函数供测试使用
+export { stopCacheCleanup };
