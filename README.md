@@ -2,11 +2,21 @@
 
 A field shortcut plugin for querying stock and fund prices in real-time.
 
+## Version
+**v1.0.0** - Node.js 14.21.0 Compatible
+
 ## Features
 - Stock price inquiry (supports Chinese A-shares, Hong Kong stocks, US stocks)
 - Fund net asset value inquiry (supports Chinese mutual funds)
-- Automatic encoding handling for Chinese characters
+- Automatic encoding handling for Chinese characters (GBK support)
 - Real-time price data from reliable sources
+- **Node.js 14.21.0 compatibility** with comprehensive polyfills
+- High-performance LRU cache for optimized data retrieval
+
+## Compatibility
+- **Node.js 14.21.0+** fully supported
+- Includes polyfills for `AbortController`, `TextDecoder`, `fetch`, and String methods
+- ES2020+ syntax compatibility (no optional chaining)
 
 ## Getting Started
 - Run `npm install` to install dependencies

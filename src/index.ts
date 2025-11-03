@@ -1,9 +1,93 @@
 import { basekit, FieldType, field, FieldComponent, FieldCode, NumberFormatter } from '@lark-opdev/block-basekit-server-api';
 
-// Node.js 14.21.0 兼容性：添加 AbortController polyfill
-if (typeof globalThis.AbortController === 'undefined') {
+// Node.js 14.21.0 兼容性：添加 AbortController、TextDecoder 和 fetch polyfill
+if (typeof global.AbortController === 'undefined') {
   const { AbortController } = require('node-abort-controller');
-  globalThis.AbortController = AbortController;
+  global.AbortController = AbortController;
+}
+
+// String.prototype.startsWith polyfill for Node.js 14.21.0
+if (!String.prototype.startsWith) {
+  String.prototype.startsWith = function(searchString: string, position: number = 0): boolean {
+    return this.substr(position, searchString.length) === searchString;
+  };
+}
+
+// String.prototype.endsWith polyfill for Node.js 14.21.0
+if (!String.prototype.endsWith) {
+  String.prototype.endsWith = function(searchString: string, length?: number): boolean {
+    const str = String(this);
+    const actualLength = length !== undefined ? Math.min(length, str.length) : str.length;
+    const start = actualLength - searchString.length;
+    return start >= 0 && str.substr(start, searchString.length) === searchString;
+  };
+}
+
+// String.prototype.padStart polyfill for Node.js 14.21.0
+if (!String.prototype.padStart) {
+  String.prototype.padStart = function(targetLength: number, padString: string = ' '): string {
+    const str = String(this);
+    if (str.length >= targetLength) {
+      return str;
+    }
+    
+    const padLength = targetLength - str.length;
+    let pad = String(padString);
+    
+    if (pad.length === 0) {
+      pad = ' ';
+    }
+    
+    // 重复 padString 直到达到所需长度
+    while (pad.length < padLength) {
+      pad += pad;
+    }
+    
+    return pad.slice(0, padLength) + str;
+  };
+}
+
+// TextDecoder polyfill for Node.js 14.21.0 with GBK support
+if (typeof global.TextDecoder === 'undefined') {
+  const iconv = require('iconv-lite');
+  
+  global.TextDecoder = class TextDecoder {
+    public readonly encoding: string;
+    public readonly fatal: boolean;
+    public readonly ignoreBOM: boolean;
+    
+    constructor(encoding: string = 'utf-8', options?: { fatal?: boolean; ignoreBOM?: boolean }) {
+      this.encoding = encoding.toLowerCase();
+      this.fatal = options?.fatal || false;
+      this.ignoreBOM = options?.ignoreBOM || false;
+    }
+    
+    decode(input: ArrayBuffer | Uint8Array): string {
+      const buffer = input instanceof ArrayBuffer ? Buffer.from(input) : Buffer.from(input);
+      
+      // 处理 GBK 编码
+      if (this.encoding === 'gbk' || this.encoding === 'gb2312') {
+        return iconv.decode(buffer, 'gbk');
+      }
+      
+      // 处理其他编码
+      if (iconv.encodingExists(this.encoding)) {
+        return iconv.decode(buffer, this.encoding);
+      }
+      
+      // 默认使用 UTF-8
+      return buffer.toString('utf8');
+    }
+  };
+}
+
+// fetch polyfill for Node.js 14.21.0
+if (typeof global.fetch === 'undefined') {
+  const fetch = require('node-fetch');
+  global.fetch = fetch;
+  global.Headers = fetch.Headers;
+  global.Request = fetch.Request;
+  global.Response = fetch.Response;
 }
 
 const { t } = field;
@@ -685,7 +769,7 @@ function parseFundDate(html: string): string {
       
       // 查找日期格式
       const dateMatch = searchText.match(/(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/);
-      if (dateMatch?.[1]) {
+      if (dateMatch && dateMatch[1]) {
         return dateMatch[1].replace(/\//g, '-');
       }
     }
@@ -694,7 +778,7 @@ function parseFundDate(html: string): string {
   // 备用方案：查找任何日期格式
   for (const pattern of PATTERNS.DATE_PATTERNS) {
     const dateMatch = html.match(pattern);
-    if (dateMatch?.[1]) {
+    if (dateMatch && dateMatch[1]) {
       return dateMatch[1].replace(/年|月/g, '-').replace(/日/g, '').replace(/\//g, '-');
     }
   }
@@ -718,7 +802,7 @@ function getActualTradeDate(dataArr: string[]): string {
 function extractStockNameFromQtData(dataArr: string[]): string {
   if (dataArr.length < 2) return '';
   
-  const stockName = dataArr[1]?.trim();
+  const stockName = dataArr[1] && dataArr[1].trim();
   
   if (stockName && stockName.length > 0) {
     let cleanedName = stockName;
@@ -738,7 +822,7 @@ function extractStockNameFromQtData(dataArr: string[]): string {
 function extractPriceFromQtData(dataArr: string[]): number {
   if (dataArr.length < 4) return 0;
   
-  const priceStr = dataArr[3]?.trim();
+  const priceStr = dataArr[3] && dataArr[3].trim();
   
   if (priceStr) {
     const price = parseFloat(priceStr);
